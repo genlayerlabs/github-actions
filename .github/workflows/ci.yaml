@@ -1,0 +1,20 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # This repo's own actions are used here on purpose: a change that breaks
+      # nix-setup breaks this job, which is the only pre-merge signal there is.
+      - uses: ./nix-setup
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          cache_pull_token: ${{ secrets.NIX_CACHE_PULL_TOKEN }}
+
+      - run: nix flake check --print-build-logs

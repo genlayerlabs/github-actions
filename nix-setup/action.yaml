@@ -1,0 +1,162 @@
+name: GenLayer nix setup
+description: Install nix, configured against the caches we substitute from.
+inputs:
+  github_token:
+    description: token nix authenticates GitHub flake inputs with; they are rate-limited without one
+    required: false
+  cache_pull_token:
+    description: >-
+      pull token for the GenLayer cache, which is private. Without one nix gets
+      401 and treats it as a cache miss — a silent full rebuild, not an error —
+      so an empty value warns. The cache stays in the substituter list either
+      way, because a self-hosted runner may hold credentials of its own. A pull
+      request from a fork gets no secrets.
+    required: false
+    default: ""
+  enable_genlayerlabs_cache:
+    description: >-
+      substitute from our own cache. Turn off to measure a cold build, or to
+      keep a job from consuming paths a broken push may have poisoned.
+    required: false
+    default: "true"
+  cache_url:
+    description: substituter URL of the GenLayer cache
+    required: false
+    default: https://nix-cache.ygr.ai/genlayer
+  cache_public_key:
+    description: trusted public key of the GenLayer cache
+    required: false
+    default: genlayer:hMvP8BkI2v8E3BtzMB9HQyIEZz/ahNdBZo/JEQ5hpVA=
+  extra_substituters:
+    description: >-
+      additional substituters, whitespace-separated. Each needs its key in
+      `extra_trusted_public_keys`, or nix refuses its paths and silently rebuilds.
+    required: false
+    default: ""
+  extra_trusted_public_keys:
+    description: additional trusted public keys, whitespace-separated
+    required: false
+    default: ""
+  extra_nix_config:
+    description: >-
+      lines appended verbatim to nix.conf, for settings this action has no input
+      for. Later lines win, so this can also override one it does.
+    required: false
+    default: ""
+outputs:
+  netrc_path:
+    description: >-
+      Path to the netrc this action wrote, or empty when no token was given.
+      Exposed so a job can reuse the same credential for something Nix does not
+      run itself — a `docker build` that fetches from the cache inside the
+      image, for instance. It is a credential: pass it as a BuildKit secret, and
+      never COPY it or bake it into an ARG.
+    value: ${{ steps.config.outputs.netrc_path }}
+  nix_config:
+    description: >-
+      The `nix.conf` lines this action generated, without the `netrc-file`
+      setting — that one points at a path on the runner and would be wrong
+      anywhere else. Append these to `/etc/nix/nix.conf` in an environment that
+      needs the same substituters, and mount the netrc at `/etc/nix/netrc`,
+      which is where nix looks by default.
+    value: ${{ steps.config.outputs.nix_config }}
+
+runs:
+  using: composite
+  steps:
+    # No `-x`: the pull token is written to a file by this step.
+    - id: config
+      shell: bash -eo pipefail {0}
+      env:
+        GENLAYERLABS_CACHE: ${{ inputs.enable_genlayerlabs_cache }}
+        CACHE_URL: ${{ inputs.cache_url }}
+        CACHE_KEY: ${{ inputs.cache_public_key }}
+        CACHE_PULL_TOKEN: ${{ inputs.cache_pull_token }}
+        EXTRA_SUBSTITUTERS: ${{ inputs.extra_substituters }}
+        EXTRA_KEYS: ${{ inputs.extra_trusted_public_keys }}
+        EXTRA_CONFIG: ${{ inputs.extra_nix_config }}
+      run: |
+        substituters="https://cache.nixos.org/ https://nix-community.cachix.org"
+        keys="cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+        keys="$keys nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
+
+        # The key stays trusted either way: disabling the cache stops us pulling
+        # from it, it does not make paths already in this store untrustworthy.
+        keys="$keys $CACHE_KEY"
+
+        netrc_config=""
+        if [ "$GENLAYERLABS_CACHE" != "false" ]; then
+          substituters="$substituters $CACHE_URL"
+
+          if [ -n "$CACHE_PULL_TOKEN" ]; then
+            # Netrc is the only way nix will authenticate to a substituter; the
+            # token goes in the password field. The daemon runs as root and
+            # reads this file, so it lives outside the workspace and never
+            # reaches an artifact.
+            netrc="${RUNNER_TEMP:-/tmp}/genlayer-nix-netrc"
+            host="$(printf '%s' "$CACHE_URL" | sed -E 's#^[a-z]+://##; s#[:/].*##')"
+            (umask 077; printf 'machine %s\nlogin x\npassword %s\n' "$host" "$CACHE_PULL_TOKEN" > "$netrc")
+            netrc_config="netrc-file = $netrc"
+          else
+            # The substituter stays listed: a self-hosted runner may already have
+            # credentials in /etc/nix/netrc, and overriding netrc-file here would
+            # throw them away. Without any, every lookup 401s, which nix reports
+            # as a miss — hence the warning.
+            echo "::warning::no cache_pull_token given; the GenLayer cache is private, so unless this runner has its own /etc/nix/netrc the job builds everything from source"
+          fi
+        fi
+
+        # nix.conf is line-based, so a multi-line input has to collapse to one.
+        append() {
+          local extra
+          extra="$(printf '%s' "$2" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')"
+          if [ -n "$extra" ]; then printf '%s %s' "$1" "$extra"; else printf '%s' "$1"; fi
+        }
+        substituters="$(append "$substituters" "$EXTRA_SUBSTITUTERS")"
+        keys="$(append "$keys" "$EXTRA_KEYS")"
+
+        # `nix_config` deliberately excludes both `netrc-file` and the caller's
+        # extra_nix_config: the first names a path that exists only on this
+        # runner, the second is the caller's own business (studio's `sandbox`
+        # settings would be wrong inside a container). Anything consuming this
+        # output elsewhere wants the substituters and nothing else.
+        {
+          echo 'nix_config<<EOF_NIX_CONFIG'
+          echo "experimental-features = nix-command flakes recursive-nix"
+          echo "substituters = $substituters"
+          echo "trusted-public-keys = $keys"
+          echo "download-attempts = 10"
+          echo "connect-timeout = 15"
+          echo "stalled-download-timeout = 60"
+          echo "fallback = true"
+          echo 'EOF_NIX_CONFIG'
+          printf 'netrc_config=%s\n' "$netrc_config"
+          printf 'netrc_path=%s\n' "${netrc:-}"
+        } >> "$GITHUB_OUTPUT"
+
+    # Pinned by commit: a tag can be moved, and this action runs with the
+    # workflow's token.
+    - uses: cachix/install-nix-action@a809471b5c7c913aa67bec8f459a11a0decc3fce # v31.6.2
+      with:
+        # Reassembled here rather than in the step above: `nix_config` is also a
+        # public output, and these two lines are runner-local.
+        extra_nix_config: |
+          ${{ steps.config.outputs.nix_config }}
+          ${{ steps.config.outputs.netrc_config }}
+          ${{ inputs.extra_nix_config }}
+        github_access_token: ${{ inputs.github_token }}
+        install_url: https://releases.nixos.org/nix/nix-2.34.7/install
+
+    # A 401 from the cache is reported as a miss, so a bad token costs a full
+    # rebuild with nothing in the log to explain it. One cheap request says so.
+    # Runs with or without a token: the runner may supply its own netrc.
+    - shell: bash -eo pipefail {0}
+      if: ${{ inputs.enable_genlayerlabs_cache != 'false' }}
+      env:
+        CACHE_URL: ${{ inputs.cache_url }}
+      run: |
+        if nix store info --store "$CACHE_URL" >/dev/null 2>&1; then
+          echo "cache $CACHE_URL is reachable"
+        else
+          echo "::warning::cannot reach $CACHE_URL with the given token (expired? wrong cache?); this job will build from source"
+        fi

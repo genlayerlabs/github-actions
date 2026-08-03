@@ -1,0 +1,27 @@
+# Ensure consistent line endings
+* text=auto eol=lf
+
+# Binary files — no diff, no merge
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.xz binary
+*.wasm binary
+
+# ML / large binary data — also linguist-vendored
+*.onnx binary linguist-vendored
+*.pt   binary linguist-vendored
+*.bin  binary
+
+# Vendored trees — not counted as project code
+vendor/**           linguist-vendored
+third-party/**      linguist-vendored
+
+# Generated files — not counted as project code
+# *.generated.*    linguist-generated   # uncomment and extend as needed
