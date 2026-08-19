@@ -84,5 +84,8 @@ runs:
           exit 0
         fi
 
-        xargs -a "$paths" "$attic_link/bin/attic" push --jobs 4 "$CACHE" \
+        # Redirect stdin from the path list rather than `xargs -a FILE`: -a is a
+        # GNU extension and BSD/macOS xargs rejects it, which broke the push on
+        # macOS runners. `< file` reads the same list and is portable.
+        < "$paths" xargs "$attic_link/bin/attic" push --jobs 4 "$CACHE" \
           || echo "::warning::attic push failed"
