@@ -13,6 +13,27 @@ inputs:
       request from a fork gets no secrets.
     required: false
     default: ""
+  cache_pull_token_ssm_parameter:
+    description: >-
+      SSM SecureString parameter holding the pull token, read in-job with
+      `aws_role_arn` instead of passing `cache_pull_token`. The cache host keeps
+      it fresh, so it never expires unnoticed. Set one of the two, not both. A
+      fork's pull request gets no OIDC token: it then warns like an empty
+      `cache_pull_token`. A failed read also only warns: the job builds from
+      source, as with a bad token.
+    required: false
+    default: ""
+  aws_role_arn:
+    description: >-
+      IAM role the job assumes with its GitHub OIDC token to read the SSM
+      parameter above (devexp-tf-infra, github-oidc-<repo>-nix-cache-tokens).
+      Required with that input; the job needs `permissions: id-token: write`.
+    required: false
+    default: ""
+  aws_region:
+    description: region of the SSM parameter
+    required: false
+    default: us-east-1
   enable_genlayerlabs_cache:
     description: >-
       substitute from our own cache. Turn off to measure a cold build, or to
@@ -72,10 +93,46 @@ runs:
         CACHE_URL: ${{ inputs.cache_url }}
         CACHE_KEY: ${{ inputs.cache_public_key }}
         CACHE_PULL_TOKEN: ${{ inputs.cache_pull_token }}
+        PULL_TOKEN_SSM_PARAMETER: ${{ inputs.cache_pull_token_ssm_parameter }}
+        AWS_ROLE_ARN: ${{ inputs.aws_role_arn }}
+        AWS_REGION_INPUT: ${{ inputs.aws_region }}
+        FORK_PR: ${{ github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name != github.repository }}
         EXTRA_SUBSTITUTERS: ${{ inputs.extra_substituters }}
         EXTRA_KEYS: ${{ inputs.extra_trusted_public_keys }}
         EXTRA_CONFIG: ${{ inputs.extra_nix_config }}
       run: |
+        if [ -n "$PULL_TOKEN_SSM_PARAMETER" ]; then
+          if [ -n "$CACHE_PULL_TOKEN" ]; then
+            echo "::error::set cache_pull_token or cache_pull_token_ssm_parameter, not both"
+            exit 1
+          fi
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::cache_pull_token_ssm_parameter needs aws_role_arn"
+            exit 1
+          fi
+          token_file="${RUNNER_TEMP:-/tmp}/genlayer-nix-pull-token"
+          rc=0
+          "$GITHUB_ACTION_PATH/../support/scripts/read-ssm-token.sh" \
+            "$AWS_ROLE_ARN" "$AWS_REGION_INPUT" "$PULL_TOKEN_SSM_PARAMETER" "$token_file" || rc=$?
+          case "$rc" in
+            0)
+              CACHE_PULL_TOKEN="$(cat "$token_file")"
+              rm -f "$token_file"
+              ;;
+            3)
+              # A fork gets no OIDC token by design; any other job without one
+              # is missing `id-token: write`, a mistake worth failing on.
+              if [ "$FORK_PR" != "true" ]; then
+                echo "::error::no OIDC token to read $PULL_TOKEN_SSM_PARAMETER; add 'permissions: id-token: write' to the job"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::warning::could not read the pull token from $PULL_TOKEN_SSM_PARAMETER; the job builds from source"
+              ;;
+          esac
+        fi
+
         substituters="https://cache.nixos.org/ https://nix-community.cachix.org"
         keys="cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
         keys="$keys nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
@@ -102,7 +159,7 @@ runs:
             # credentials in /etc/nix/netrc, and overriding netrc-file here would
             # throw them away. Without any, every lookup 401s, which nix reports
             # as a miss — hence the warning.
-            echo "::warning::no cache_pull_token given; the GenLayer cache is private, so unless this runner has its own /etc/nix/netrc the job builds everything from source"
+            echo "::warning::no pull token; the GenLayer cache is private, so unless this runner has its own /etc/nix/netrc the job builds everything from source"
           fi
         fi
 
