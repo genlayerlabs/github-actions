@@ -17,7 +17,9 @@ nix-setup/action.yaml   →  genlayerlabs/github-actions/nix-setup@main
   empty, not just what it is.
 - Never `set -x` in a step that handles a token.
 - An action that talks to the cache must not fail the job when the cache is
-  unavailable. Warn and continue.
+  unavailable. Warn and continue — unless the caller opts in to failing, as
+  `nix-cache-push` does with `verify: "true"`. The default stays warn-only, so
+  no existing consumer changes behaviour.
 
 ## Testing
 
