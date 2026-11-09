@@ -57,13 +57,14 @@ Notes:
 
 Uploads paths this job built locally.
 
-| Input      | Default                    | Description                                  |
-| ---------- | -------------------------- | -------------------------------------------- |
-| `token`    | `""`                       | push token; empty skips the step entirely    |
-| `cache`    | `genlayer`                 | cache name on the server                     |
-| `endpoint` | `https://nix-cache.ygr.ai` | attic server                                 |
-| `include`  | `genlayer\|genvm`          | regex on the store path name, hash stripped  |
-| `exclude`  | `""`                       | regex on the full store path; empty disables |
+| Input      | Default                    | Description                                                                |
+| ---------- | -------------------------- | -------------------------------------------------------------------------- |
+| `token`    | `""`                       | push token; empty skips the step entirely                                  |
+| `cache`    | `genlayer`                 | cache name on the server                                                   |
+| `endpoint` | `https://nix-cache.ygr.ai` | attic server                                                               |
+| `include`  | `genlayer\|genvm`          | regex on the store path name, hash stripped                                |
+| `exclude`  | `""`                       | regex on the full store path; empty disables                               |
+| `verify`   | `"false"`                  | `"true"` fails the job unless every pushed path is in the cache afterwards |
 
 Notes:
 
@@ -73,7 +74,14 @@ Notes:
 - Guard the step with `if: ${{ !cancelled() }}`, not the default `success()`. A
   job that failed late still built most of the closure, and that is the work a
   retry should not repeat.
-- Every failure warns and exits 0. A cache that refuses uploads must not turn a
-  green build red.
+- By default every failure warns and exits 0. A cache that refuses uploads must
+  not turn a green build red.
+- `verify: "true"` is the opt-in exception, for a job whose output consumers
+  depend on (a release, the build that warms a branch head). A failed client
+  build, path listing, login or upload exits 1, and each pushed path is then
+  read back (`<endpoint>/<cache>/<hash>.narinfo` with the push token, which can
+  pull): any answer but 200 fails the job and names the path and the HTTP code.
+  This is what makes an expired push token visible — without it a refused push
+  is only a warning in a green job. It needs `curl`.
 - Requires `jq` and a flake in `$GITHUB_WORKSPACE` (`--inputs-from .` resolves
   the attic client through your lock file rather than the mutable registry).
