@@ -11,6 +11,11 @@ Nix pointed at our substituters, and push what it built to the shared binary
 cache. Keeping one copy here means a change to the cache endpoint, a key
 rotation, or a pinned installer bump lands in one place instead of nine.
 
+The same goes for GitHub App tokens. A pull request opened with the workflow's
+own `GITHUB_TOKEN` starts no workflows, so a bot that opens PRs needs an App
+token, and the App's key lives in AWS SSM, GCP Secret Manager or a repository
+secret depending on the repository. `app-token` reads it from any of them.
+
 ## Install
 
 Nothing to install — reference an action by path and ref:
@@ -51,10 +56,25 @@ jobs:
           token: ${{ secrets.NIX_CACHE_PUSH_TOKEN }}
 ```
 
-| Action                                         | Purpose                                          |
-| ---------------------------------------------- | ------------------------------------------------ |
-| [`nix-setup`](nix-setup/action.yaml)           | install Nix, wire up substituters and cache auth |
-| [`nix-cache-push`](nix-cache-push/action.yaml) | upload locally-built paths to the cache          |
+| Action                                         | Purpose                                                  |
+| ---------------------------------------------- | -------------------------------------------------------- |
+| [`nix-setup`](nix-setup/action.yaml)           | install Nix, wire up substituters and cache auth         |
+| [`nix-cache-push`](nix-cache-push/action.yaml) | upload locally-built paths to the cache                  |
+| [`app-token`](app-token/action.yaml)           | GitHub App token, key read from a secret, AWS SSM or GCP |
+
+An App token, with the key in the repository's own secrets:
+
+```yaml
+- id: app-token
+  uses: genlayerlabs/github-actions/app-token@main
+  with:
+    client_id: ${{ vars.PR_BOT_CLIENT_ID }}
+    private_key: ${{ secrets.PR_BOT_PRIVATE_KEY }}
+
+- run: gh pr create --fill
+  env:
+    GH_TOKEN: ${{ steps.app-token.outputs.token }}
+```
 
 The cache is **private** — `nix-setup` needs `cache_pull_token` or it will build
 everything from source. See [nix-cache.md](docs/using/nix-cache.md) for what the

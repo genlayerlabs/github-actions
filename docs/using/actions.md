@@ -104,3 +104,61 @@ Notes:
   step; any other job without an OIDC token fails.
 - Requires `jq` and a flake in `$GITHUB_WORKSPACE` (`--inputs-from .` resolves
   the attic client through your lock file rather than the mutable registry).
+
+## app-token
+
+Generates a GitHub App installation token. The App's client ID and private key
+come from exactly one source: passed in directly, AWS SSM, or GCP Secret
+Manager. A pull request opened, or a push made, with this token starts
+workflows; one made with the workflow's own `GITHUB_TOKEN` does not.
+
+| Input                       | Default        | Description                                                                                      |
+| --------------------------- | -------------- | ------------------------------------------------------------------------------------------------ |
+| `client_id`                 | `""`           | direct: the App's client ID (a repository variable)                                              |
+| `private_key`               | `""`           | direct: the App's private key (a repository secret)                                              |
+| `client_id_ssm_parameter`   | `""`           | aws: SSM parameter holding the client ID                                                         |
+| `private_key_ssm_parameter` | `""`           | aws: SSM SecureString parameter holding the private key                                          |
+| `aws_role_arn`              | `""`           | aws: role the job assumes with its OIDC token; empty uses the runner's own AWS credentials       |
+| `aws_region`                | `us-east-1`    | aws: region of the SSM parameters                                                                |
+| `gcp_wif_provider`          | `""`           | gcp: Workload Identity Federation provider; needs `id-token: write`                              |
+| `gcp_service_account`       | `""`           | gcp: service account to impersonate, with access to both secrets                                 |
+| `gcp_project_id`            | `""`           | gcp: project holding the secrets                                                                 |
+| `client_id_gcp_secret`      | `""`           | gcp: Secret Manager secret holding the client ID                                                 |
+| `private_key_gcp_secret`    | `""`           | gcp: Secret Manager secret holding the private key                                               |
+| `owner`                     | `genlayerlabs` | owner of the App installation                                                                    |
+| `repositories`              | `""`           | comma-separated repository names to limit the token to; empty reaches every repository installed |
+
+Outputs:
+
+| Output  | Description                                                          |
+| ------- | -------------------------------------------------------------------- |
+| `token` | the installation token; expires after an hour, revoked when job ends |
+
+```yaml
+# The key in AWS SSM, read with an OIDC role on a GitHub-hosted runner
+- id: app-token
+  uses: genlayerlabs/github-actions/app-token@main
+  with:
+    client_id_ssm_parameter: /devexp-dev/e2e-runner/secrets/app-client-id
+    private_key_ssm_parameter: /devexp-dev/e2e-runner/secrets/app-private-key
+    aws_role_arn: arn:aws:iam::<account>:role/<role>
+```
+
+Notes:
+
+- The source is the group of inputs that has any value. Setting inputs of two
+  sources, or only part of one, fails the job and names what is missing.
+- A pull request from a fork gets no secrets and no OIDC token, so no source
+  works there; the job fails, saying so.
+- `aws` without `aws_role_arn` relies on the runner's own credentials: an EC2
+  runner's instance profile. A GitHub-hosted runner has none. With a role, the
+  read goes through `support/scripts/read-ssm-token.sh`, as for `nix-setup`.
+  A parameter still holding `CHANGE_ME` fails the job.
+- `gcp` authenticates with `google-github-actions/auth`, which writes a
+  credentials file in the workspace for the rest of the job, like any job that
+  uses that action. The provider's attribute condition must allow the calling
+  repository (genlayer-wif-management).
+- The private key is masked line by line whichever source it comes from: a mask
+  covers one line, so a key masked as a whole stays readable line by line.
+- Without `repositories`, the token reaches every repository the App is
+  installed on under `owner`. Limit it when the job needs only some.

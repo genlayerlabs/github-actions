@@ -1,0 +1,207 @@
+name: GenLayer app token
+description: >-
+  Generate a short-lived GitHub App installation token from the app's client ID
+  and private key, wherever they are kept: passed in directly, in AWS SSM, or in
+  GCP Secret Manager.
+inputs:
+  client_id:
+    description: >-
+      the app's client ID, passed in directly (a repository variable). Set it
+      with `private_key`, and set no other source. A wrong value fails the job
+      when the token is generated.
+    required: false
+    default: ""
+  private_key:
+    description: >-
+      the app's private key, passed in directly (a repository secret). A pull
+      request from a fork gets no secrets: the key is then empty and the job
+      fails, saying so.
+    required: false
+    default: ""
+  client_id_ssm_parameter:
+    description: >-
+      SSM parameter holding the client ID. Set it with
+      `private_key_ssm_parameter`, and set no other source. A parameter that
+      cannot be read, or still holds `CHANGE_ME`, fails the job.
+    required: false
+    default: ""
+  private_key_ssm_parameter:
+    description: SSM SecureString parameter holding the private key
+    required: false
+    default: ""
+  aws_role_arn:
+    description: >-
+      IAM role the job assumes with its GitHub OIDC token to read the SSM
+      parameters; the job needs `permissions: id-token: write`. Empty uses the
+      runner's own AWS credentials, which only a self-hosted runner has (an EC2
+      instance profile); on a GitHub-hosted runner the read then fails.
+    required: false
+    default: ""
+  aws_region:
+    description: region of the SSM parameters
+    required: false
+    default: us-east-1
+  gcp_wif_provider:
+    description: >-
+      Workload Identity Federation provider the job authenticates to GCP with;
+      the job needs `permissions: id-token: write`. Set it with
+      `gcp_service_account`, `gcp_project_id`, `client_id_gcp_secret` and
+      `private_key_gcp_secret`, and set no other source. A repository the
+      provider's attribute condition does not allow fails at authentication.
+    required: false
+    default: ""
+  gcp_service_account:
+    description: service account the job impersonates; it needs access to both secrets
+    required: false
+    default: ""
+  gcp_project_id:
+    description: GCP project holding the secrets
+    required: false
+    default: ""
+  client_id_gcp_secret:
+    description: Secret Manager secret holding the client ID
+    required: false
+    default: ""
+  private_key_gcp_secret:
+    description: Secret Manager secret holding the private key
+    required: false
+    default: ""
+  owner:
+    description: >-
+      owner of the app installation. With no `repositories`, the token reaches
+      every repository the app is installed on there.
+    required: false
+    default: genlayerlabs
+  repositories:
+    description: >-
+      comma-separated repositories (names only) to limit the token to. A
+      repository the app is not installed on fails the job.
+    required: false
+    default: ""
+outputs:
+  token:
+    description: >-
+      The installation token. It expires after an hour and is revoked when the
+      job ends. A pull request it opens, or a push it makes, starts workflows,
+      unlike one made with the workflow's own GITHUB_TOKEN.
+    value: ${{ steps.token.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    # No `-x`: the private key passes through this step.
+    - id: source
+      shell: bash -eo pipefail {0}
+      env:
+        CLIENT_ID: ${{ inputs.client_id }}
+        PRIVATE_KEY: ${{ inputs.private_key }}
+        CLIENT_ID_SSM: ${{ inputs.client_id_ssm_parameter }}
+        PRIVATE_KEY_SSM: ${{ inputs.private_key_ssm_parameter }}
+        AWS_ROLE_ARN: ${{ inputs.aws_role_arn }}
+        AWS_REGION_INPUT: ${{ inputs.aws_region }}
+        GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+        GCP_SERVICE_ACCOUNT: ${{ inputs.gcp_service_account }}
+        GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+        CLIENT_ID_GCP: ${{ inputs.client_id_gcp_secret }}
+        PRIVATE_KEY_GCP: ${{ inputs.private_key_gcp_secret }}
+      run: |
+        # Each source is a group of inputs: the one with any input set is the
+        # source, and all of its inputs must be set.
+        sources=()
+        [ -n "$CLIENT_ID$PRIVATE_KEY" ] && sources+=(direct)
+        [ -n "$CLIENT_ID_SSM$PRIVATE_KEY_SSM" ] && sources+=(aws)
+        [ -n "$GCP_WIF_PROVIDER$GCP_SERVICE_ACCOUNT$GCP_PROJECT_ID$CLIENT_ID_GCP$PRIVATE_KEY_GCP" ] && sources+=(gcp)
+        if [ "${#sources[@]}" -ne 1 ]; then
+          echo "::error::set the inputs of exactly one source (client_id + private_key, the *_ssm_parameter pair, or the gcp_* inputs); got: ${sources[*]:-none}"
+          exit 1
+        fi
+        missing=()
+        case "${sources[0]}" in
+          direct)
+            [ -n "$CLIENT_ID" ] || missing+=(client_id)
+            [ -n "$PRIVATE_KEY" ] || missing+=("private_key (a fork's pull request gets no secrets)")
+            ;;
+          aws)
+            [ -n "$CLIENT_ID_SSM" ] || missing+=(client_id_ssm_parameter)
+            [ -n "$PRIVATE_KEY_SSM" ] || missing+=(private_key_ssm_parameter)
+            ;;
+          gcp)
+            [ -n "$GCP_WIF_PROVIDER" ] || missing+=(gcp_wif_provider)
+            [ -n "$GCP_SERVICE_ACCOUNT" ] || missing+=(gcp_service_account)
+            [ -n "$GCP_PROJECT_ID" ] || missing+=(gcp_project_id)
+            [ -n "$CLIENT_ID_GCP" ] || missing+=(client_id_gcp_secret)
+            [ -n "$PRIVATE_KEY_GCP" ] || missing+=(private_key_gcp_secret)
+            ;;
+        esac
+        if [ "${#missing[@]}" -gt 0 ]; then
+          printf -v list '%s, ' "${missing[@]}"
+          echo "::error::the ${sources[0]} source is missing: ${list%, }"
+          exit 1
+        fi
+        echo "source=${sources[0]}" >> "$GITHUB_OUTPUT"
+
+        if [ "${sources[0]}" = aws ]; then
+          work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/app-token.XXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          for pair in "client_id:$CLIENT_ID_SSM" "private_key:$PRIVATE_KEY_SSM"; do
+            name="${pair%%:*}"
+            parameter="${pair#*:}"
+            rc=0
+            "$GITHUB_ACTION_PATH/../support/scripts/read-ssm-token.sh" \
+              "$AWS_ROLE_ARN" "$AWS_REGION_INPUT" "$parameter" "$work/$name" || rc=$?
+            case "$rc" in
+              0) ;;
+              3)
+                echo "::error::no OIDC token to read $parameter; add 'permissions: id-token: write' to the job (a fork's pull request gets none)"
+                exit 1
+                ;;
+              *)
+                echo "::error::could not read $parameter; see the message above"
+                exit 1
+                ;;
+            esac
+            # A random delimiter: a fixed one could appear in the value and end
+            # the output early.
+            delimiter="EOF_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+            {
+              echo "$name<<$delimiter"
+              cat "$work/$name"
+              echo
+              echo "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          done
+        fi
+
+    # Pinned by commit: a tag can be moved, and these steps handle the app key.
+    - if: steps.source.outputs.source == 'gcp'
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs.gcp_wif_provider }}
+        service_account: ${{ inputs.gcp_service_account }}
+
+    - id: gcp
+      if: steps.source.outputs.source == 'gcp'
+      uses: google-github-actions/get-secretmanager-secrets@bc9c54b29fdffb8a47776820a7d26e77b379d262 # v3.0.0
+      with:
+        secrets: |-
+          client_id:${{ inputs.gcp_project_id }}/${{ inputs.client_id_gcp_secret }}
+          private_key:${{ inputs.gcp_project_id }}/${{ inputs.private_key_gcp_secret }}
+
+    # A mask covers one line. The secret action masks the key as a whole, which
+    # leaves each of its lines readable if something prints them one by one.
+    - if: steps.source.outputs.source == 'gcp'
+      shell: bash -eo pipefail {0}
+      env:
+        PRIVATE_KEY: ${{ steps.gcp.outputs.private_key }}
+      run: |
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then echo "::add-mask::$line"; fi
+        done <<<"$PRIVATE_KEY"
+
+    - id: token
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.client_id || steps.source.outputs.client_id || steps.gcp.outputs.client_id }}
+        private-key: ${{ inputs.private_key || steps.source.outputs.private_key || steps.gcp.outputs.private_key }}
+        owner: ${{ inputs.owner }}
+        repositories: ${{ inputs.repositories }}
